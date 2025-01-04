@@ -1,28 +1,40 @@
+import csv
+import json
 import math
 import os
+from datetime import datetime
 
 import community as community_louvain
 import networkx as nx
 import numpy as np
 import scipy as sp
-import scipy.sparse
 import scipy.sparse as sparse
 import torch
 import torch.nn.functional as F
-from extract_feats import extract_feats, extract_numbers
+from extract_feats import (
+    extract_encoding,
+    extract_feats,
+    extract_numbers,
+    extract_prompt_encodings,
+)
 from grakel.kernels import VertexHistogram, WeisfeilerLehman
 from grakel.utils import graph_from_networkx
-from torch import Tensor
-from torch.utils.data import Dataset
+from prompt_encoding import PromptEncoder
 from torch_geometric.data import Data
 from tqdm import tqdm
+from transformers import AutoTokenizer
 
 
-def preprocess_dataset(dataset, n_max_nodes, spectral_emb_dim):
+def preprocess_dataset(dataset, n_max_nodes, spectral_emb_dim, model_name: str='sentence-transformers/all-MiniLM-L6-v2'):
     data_lst = []
+
+    ### Load the prompt encoder and tokenizer for graph descriptions
+    prompt_encoder = PromptEncoder(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
     if dataset == 'test':
-        filename = './data/dataset_'+dataset+'.pt'
-        desc_file = './data/'+dataset+'/test.txt'
+        filename = '../../data/dataset_'+dataset+'.pt'
+        desc_file = '../../data/'+dataset+'/test.txt'
 
         if os.path.isfile(filename):
             data_lst = torch.load(filename)
@@ -37,17 +49,18 @@ def preprocess_dataset(dataset, n_max_nodes, spectral_emb_dim):
                 desc = tokens[1:]
                 desc = "".join(desc)
                 feats_stats = extract_numbers(desc)
+                feats_encoded = extract_encoding(desc, prompt_encoder, tokenizer)
                 feats_stats = torch.FloatTensor(feats_stats).unsqueeze(0)
-                data_lst.append(Data(stats=feats_stats, filename = graph_id))
-            fr.close()                    
+                data_lst.append(Data(stats=feats_stats, prompt=feats_encoded, filename = graph_id))
+            fr.close()
             torch.save(data_lst, filename)
             print(f'Dataset {filename} saved')
 
 
     else:
-        filename = './data/dataset_'+dataset+'.pt'
-        graph_path = './data/'+dataset+'/graph'
-        desc_path = './data/'+dataset+'/description'
+        filename = '../../data/dataset_'+dataset+'.pt'
+        graph_path = '../../data/'+dataset+'/graph'
+        desc_path = '../../data/'+dataset+'/description'
 
         if os.path.isfile(filename):
             data_lst = torch.load(filename)
@@ -81,7 +94,7 @@ def preprocess_dataset(dataset, n_max_nodes, spectral_emb_dim):
                 # use canonical order (BFS) to create adjacency matrix
                 ### BFS & DFS from largest-degree node
 
-                
+
                 CGs = [G.subgraph(c) for c in nx.connected_components(G)]
 
                 # rank connected componets from large to small size
@@ -103,7 +116,7 @@ def preprocess_dataset(dataset, n_max_nodes, spectral_emb_dim):
                 diags = np.squeeze(np.asarray(diags))
                 D = sparse.diags(diags).toarray()
                 L = D - adj_bfs
-                with sp.errstate(divide="ignore"):
+                with np.errstate(divide="ignore"):
                     diags_sqrt = 1.0 / np.sqrt(diags)
                 diags_sqrt[np.isinf(diags_sqrt)] = 0
                 DH = sparse.diags(diags).toarray()
@@ -127,9 +140,10 @@ def preprocess_dataset(dataset, n_max_nodes, spectral_emb_dim):
                 adj = adj.unsqueeze(0)
 
                 feats_stats = extract_feats(fstats)
+                feats_encoded = extract_encoding(fstats, prompt_encoder, tokenizer)
                 feats_stats = torch.FloatTensor(feats_stats).unsqueeze(0)
 
-                data_lst.append(Data(x=x, edge_index=edge_index, A=adj, stats=feats_stats, filename = filen))
+                data_lst.append(Data(x=x, edge_index=edge_index, A=adj, stats=feats_stats, prompt=feats_encoded, filename = filen))
             torch.save(data_lst, filename)
             print(f'Dataset {filename} saved')
     return data_lst
@@ -146,14 +160,10 @@ def construct_nx_from_adj(adj):
     G.remove_nodes_from(to_remove)
     return G
 
-
-
 def handle_nan(x):
     if math.isnan(x):
         return float(-100)
     return x
-
-
 
 
 def masked_instance_norm2D(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-5):
@@ -219,6 +229,18 @@ def sigmoid_beta_schedule(timesteps):
     return torch.sigmoid(betas) * (beta_end - beta_start) + beta_start
 
 
+def create_training_folder(description, args):
+    dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    training_folder = f"/Users/maximemoutet/Documents/Scolaire/M2DS/ALTEGRAD/data-challenge/data/trainings/training_{dt_str}"
+    os.makedirs(training_folder, exist_ok=True)
 
-
-
+    # Enregistrer les arguments et la description dans un fichier texte
+    args_file = os.path.join(training_folder, "training_description.txt")
+    with open(args_file, mode="w") as file:
+        file.write("Training Description:\n")
+        file.write(description + "\n\n")
+        file.write("Arguments:\n")
+        for arg, value in vars(args).items():
+            file.write(f"{arg}: {value}\n")
+    
+    return training_folder

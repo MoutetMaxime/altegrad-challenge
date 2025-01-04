@@ -25,12 +25,12 @@ def q_sample(x_start, t, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, noi
 
 
 # Loss function for denoising
-def p_losses(denoise_model, x_start, t, cond, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, noise=None, loss_type="l1"):
+def p_losses(denoise_model, x_start, t, conds, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, noise=None, loss_type="l1"):
     if noise is None:
         noise = torch.randn_like(x_start)
 
     x_noisy = q_sample(x_start, t, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, noise=noise)
-    predicted_noise = denoise_model(x_noisy, t, cond)
+    predicted_noise = denoise_model(x_noisy, t, conds)
 
     if loss_type == 'l1':
         loss = F.l1_loss(noise, predicted_noise)
@@ -62,7 +62,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
 
 # Denoise model
 class DenoiseNN(nn.Module):
-    def __init__(self, input_dim, hidden_dim, n_layers, n_cond, d_cond):
+    def __init__(self, input_dim, hidden_dim, n_layers, n_cond, d_cond, d_prompt):
         super(DenoiseNN, self).__init__()
         self.n_layers = n_layers
         self.n_cond = n_cond
@@ -79,7 +79,8 @@ class DenoiseNN(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        mlp_layers = [nn.Linear(input_dim+d_cond, hidden_dim)] + [nn.Linear(hidden_dim+d_cond, hidden_dim) for i in range(n_layers-2)]
+        # MLP: input dim is composed of input_dim + d_cond + d_prompt
+        mlp_layers = [nn.Linear(input_dim+d_cond+d_prompt, hidden_dim)] + [nn.Linear(hidden_dim+d_cond+d_prompt, hidden_dim) for i in range(n_layers-2)]
         mlp_layers.append(nn.Linear(hidden_dim, input_dim))
         self.mlp = nn.ModuleList(mlp_layers)
 
@@ -89,10 +90,15 @@ class DenoiseNN(nn.Module):
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
 
-    def forward(self, x, t, cond):
+    def forward(self, x, t, conds):
+        cond = conds[0]
         cond = torch.reshape(cond, (-1, self.n_cond))
         cond = torch.nan_to_num(cond, nan=-100.0)
-        cond = self.cond_mlp(cond)
+        cond = self.cond_mlp(cond)  # (batch_size, d_cond)
+
+        # condition on prompt description: concatenate with cond from numerical features and prompt embeddings
+        cond = torch.cat((cond, conds[1]), dim=1) # (batch_size, d_cond + d_prompt)
+
         t = self.time_mlp(t)
         for i in range(self.n_layers-1):
             x = torch.cat((x, cond), dim=1)
@@ -103,7 +109,7 @@ class DenoiseNN(nn.Module):
 
 
 @torch.no_grad()
-def p_sample(model, x, t, cond, t_index, betas):
+def p_sample(model, x, t, conds, t_index, betas):
     # define alphas
     alphas = 1. - betas
     alphas_cumprod = torch.cumprod(alphas, axis=0)
@@ -126,7 +132,7 @@ def p_sample(model, x, t, cond, t_index, betas):
     # Equation 11 in the paper
     # Use our model (noise predictor) to predict the mean
     model_mean = sqrt_recip_alphas_t * (
-        x - betas_t * model(x, t, cond) / sqrt_one_minus_alphas_cumprod_t
+        x - betas_t * model(x, t, conds) / sqrt_one_minus_alphas_cumprod_t
     )
 
     if t_index == 0:
@@ -139,7 +145,7 @@ def p_sample(model, x, t, cond, t_index, betas):
 
 # Algorithm 2 (including returning all images)
 @torch.no_grad()
-def p_sample_loop(model, cond, timesteps, betas, shape):
+def p_sample_loop(model, conds, timesteps, betas, shape):
     device = next(model.parameters()).device
 
     b = shape[0]
@@ -148,7 +154,7 @@ def p_sample_loop(model, cond, timesteps, betas, shape):
     imgs = []
 
     for i in reversed(range(0, timesteps)):
-        img = p_sample(model, img, torch.full((b,), i, device=device, dtype=torch.long), cond, i, betas)
+        img = p_sample(model, img, torch.full((b,), i, device=device, dtype=torch.long), conds, i, betas)
         imgs.append(img)
         #imgs.append(img.cpu().numpy())
     return imgs
@@ -156,5 +162,5 @@ def p_sample_loop(model, cond, timesteps, betas, shape):
 
 
 @torch.no_grad()
-def sample(model, cond, latent_dim, timesteps, betas, batch_size):
-    return p_sample_loop(model, cond, timesteps, betas, shape=(batch_size, latent_dim))
+def sample(model, conds, latent_dim, timesteps, betas, batch_size):
+    return p_sample_loop(model, conds, timesteps, betas, shape=(batch_size, latent_dim))
