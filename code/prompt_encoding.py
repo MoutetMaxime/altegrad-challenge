@@ -1,11 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel
 
 
-def mean_pooling(model_output, attention_mask):
+def mean_pooling(model_output: torch.Tensor, attention_mask: torch.Tensor):
     """
     Mean pooling of token embeddings, with support for attention mask
     source: "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2"
@@ -16,14 +15,13 @@ def mean_pooling(model_output, attention_mask):
 
 
 class PromptEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, model_name: str ='sentence-transformers/all-MiniLM-L6-v2'):
         super(PromptEncoder, self).__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
-        self.model = AutoModel.from_pretrained('sentence-transformers/all-MiniLM-L6-v2')
+        self.model = AutoModel.from_pretrained(model_name)
 
-    def forward(self, sentences: list):
-        encoded_input = self.tokenizer(sentences, padding=True, truncation=True, return_tensors='pt')
+    def forward(self, encoded_input: torch.Tensor):
         model_output = self.model(**encoded_input)
+
         sentence_embeddings = mean_pooling(model_output, encoded_input['attention_mask'])
         sentence_embeddings = F.normalize(sentence_embeddings, p=2, dim=1)
         return sentence_embeddings  # (batch_size, embedding_dim)

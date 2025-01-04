@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GINConv, global_add_pool
+from torch_geometric.nn import GATConv, GINConv, global_add_pool
 
 
 # Decoder
@@ -71,6 +71,46 @@ class GIN(torch.nn.Module):
         out = self.bn(out)
         out = self.fc(out)
         return out
+    
+
+# GAT Model
+class GAT(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, latent_dim, n_layers, heads=4, dropout=0.2):
+        super().__init__()
+        self.dropout = dropout
+
+        self.convs = torch.nn.ModuleList()
+        # Première couche GAT
+        self.convs.append(GATConv(in_channels=input_dim, 
+                                  out_channels=hidden_dim // heads, 
+                                  heads=heads, 
+                                  concat=True))  # concat=True pour concaténer les têtes d'attention
+
+        # Couches intermédiaires
+        for _ in range(n_layers - 1):
+            self.convs.append(GATConv(in_channels=hidden_dim, 
+                                      out_channels=hidden_dim // heads, 
+                                      heads=heads, 
+                                      concat=True))
+        
+        self.bn = nn.BatchNorm1d(hidden_dim)
+        self.fc = nn.Linear(hidden_dim, latent_dim)
+
+    def forward(self, data):
+        edge_index = data.edge_index
+        x = data.x
+
+        for conv in self.convs:
+            x = conv(x, edge_index)  # Passage dans chaque couche GAT
+            x = F.leaky_relu(x, 0.2)  # Fonction d'activation
+            x = F.dropout(x, self.dropout, training=self.training)
+
+        # Pooling global
+        out = global_add_pool(x, data.batch)
+        out = self.bn(out)
+        out = self.fc(out)
+        return out
+
 
 
 # Variational Autoencoder
@@ -79,7 +119,15 @@ class VariationalAutoEncoder(nn.Module):
         super(VariationalAutoEncoder, self).__init__()
         self.n_max_nodes = n_max_nodes
         self.input_dim = input_dim
+
+        ### GAT ENCODER
+        # self.encoder = GAT(input_dim, hidden_dim_enc, hidden_dim_enc, n_layers_enc)
+        ###
+
+        ### GIN ENCODER
         self.encoder = GIN(input_dim, hidden_dim_enc, hidden_dim_enc, n_layers_enc)
+        ###
+
         self.fc_mu = nn.Linear(hidden_dim_enc, latent_dim)
         self.fc_logvar = nn.Linear(hidden_dim_enc, latent_dim)
         self.decoder = Decoder(latent_dim, hidden_dim_dec, n_layers_dec, n_max_nodes)

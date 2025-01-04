@@ -21,7 +21,13 @@ from torch.utils.data import Subset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
-from utils import construct_nx_from_adj, linear_beta_schedule, preprocess_dataset
+from utils import (
+    construct_nx_from_adj,
+    create_training_folder,
+    linear_beta_schedule,
+    preprocess_dataset,
+)
+from warmup_scheduler import WarmupReduceLROnPlateau
 
 np.random.seed(13)
 
@@ -97,16 +103,23 @@ parser.add_argument('--dim-condition', type=int, default=128, help="Dimensionali
 # Number of conditions used in conditional vector (number of properties)
 parser.add_argument('--n-condition', type=int, default=7, help="Number of distinct condition properties used in conditional vector (default: 7)")
 
+# Dimensionality of prompt embeddings
+parser.add_argument('--dim-prompt', type=int, default=384, help="Dimensionality of prompt embeddings (default: 384)")
+
+parser.add_argument('--promp-encoding-model', type=str, default='sentence-transformers/all-MiniLM-L6-v2', help="Prompt encoding model (default: sentence-transformers/all-MiniLM-L6-v2)")
+
+parser.add_argument("--metrics-name", type=str, default="metrics.csv", help="Name of the metrics file (default: metrics.csv)")
+parser.add_argument("--denoiser-metrics-name", type=str, default="denoiser_metrics.csv", help="Name of the denoiser metrics file (default: denoiser_metrics.csv)")
+parser.add_argument("--training-description", type=str, default="This training session focuses on VGAE and Denoiser models with specific hyperparameters and data preprocessing methods.", help="Description of the training session (default: This training session focuses on VGAE and Denoiser models with specific hyperparameters and data preprocessing methods.)")
+
 args = parser.parse_args()
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 # preprocess train data, validation data and test data. Only once for the first time that you run the code. Then the appropriate .pt files will be saved and loaded.
-trainset = preprocess_dataset("train", args.n_max_nodes, args.spectral_emb_dim)
-validset = preprocess_dataset("valid", args.n_max_nodes, args.spectral_emb_dim)
-testset = preprocess_dataset("test", args.n_max_nodes, args.spectral_emb_dim)
-
-
+trainset = preprocess_dataset("train", args.n_max_nodes, args.spectral_emb_dim, args.promp_encoding_model)
+validset = preprocess_dataset("valid", args.n_max_nodes, args.spectral_emb_dim, args.promp_encoding_model)
+testset = preprocess_dataset("test", args.n_max_nodes, args.spectral_emb_dim, args.promp_encoding_model)
 
 # initialize data loaders
 train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True)
@@ -117,8 +130,46 @@ test_loader = DataLoader(testset, batch_size=args.batch_size, shuffle=False)
 # initialize VGAE model
 autoencoder = VariationalAutoEncoder(args.spectral_emb_dim+1, args.hidden_dim_encoder, args.hidden_dim_decoder, args.latent_dim, args.n_layers_encoder, args.n_layers_decoder, args.n_max_nodes).to(device)
 
-optimizer = torch.optim.Adam(autoencoder.parameters(), lr=args.lr)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
+# optimizer = torch.optim.Adam(autoencoder.parameters(), lr=args.lr)
+optimizer = torch.optim.AdamW(autoencoder.parameters(), lr=args.lr, betas=(0.9, 0.999))
+
+
+# scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
+### Scheduler ###
+# decrease learning rate by a factor of 0.5 if the train reconstruction loss does not decrease for 10 epochs
+# add a warm-up phase for the first 100 epochs
+reduce_on_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+warmup_scheduler = WarmupReduceLROnPlateau(
+    optimizer=optimizer,
+    scheduler=reduce_on_plateau,
+    warmup_steps=100,
+    initial_lr=1e-5,
+    target_lr=1e-3
+)
+
+
+# Fichier pour sauvegarder les métriques
+metrics_file = args.metrics_name
+denoiser_metrics_file = args.denoiser_metrics_name
+training_description = args.training_description
+
+# Créer le dossier pour l'entraînement
+training_folder = create_training_folder(training_description, args)
+
+# Fichiers de métriques dans le dossier
+vgae_metrics_file = os.path.join(training_folder, metrics_file)
+denoiser_metrics_file = os.path.join(training_folder, denoiser_metrics_file)
+
+
+# Sauvegarde des métriques dans un fichier CSV
+with open(vgae_metrics_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(["Epoch", "Learning Rate", "Train Loss", "Train Recon Loss", "Train KLD Loss", 
+                     "Val Loss", "Val Recon Loss", "Val KLD Loss"])
+
+with open(denoiser_metrics_file, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(["Epoch", "Learning Rate", "Train Loss", "Val Loss"])
 
 
 # Train VGAE model
@@ -160,11 +211,27 @@ if args.train_autoencoder:
             cnt_val+=1
             val_count += torch.max(data.batch)+1
 
+        # Logging et sauvegarde des métriques
+        current_lr = warmup_scheduler.get_last_lr()[-1]
+        train_loss_avg = train_loss_all / cnt_train
+        val_loss_avg = val_loss_all / cnt_val
+        train_recon_avg = train_loss_all_recon / cnt_train
+        train_kld_avg = train_loss_all_kld / cnt_train
+        val_recon_avg = val_loss_all_recon / cnt_val
+        val_kld_avg = val_loss_all_kld / cnt_val
+
         if epoch % 1 == 0:
             dt_t = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            print('{} Epoch: {:04d}, Train Loss: {:.5f}, Train Reconstruction Loss: {:.2f}, Train KLD Loss: {:.2f}, Val Loss: {:.5f}, Val Reconstruction Loss: {:.2f}, Val KLD Loss: {:.2f}'.format(dt_t,epoch, train_loss_all/cnt_train, train_loss_all_recon/cnt_train, train_loss_all_kld/cnt_train, val_loss_all/cnt_val, val_loss_all_recon/cnt_val, val_loss_all_kld/cnt_val))
+            print('{} Epoch: {:04d}, lr: {:.5f}, Train Loss: {:.5f}, Train Recon Loss: {:.3f}, Train KLD Loss: {:.2f}, Val Loss: {:.5f}, Val Recon Loss: {:.3f}, Val KLD Loss: {:.2f}'.format(
+                dt_t, epoch, current_lr, train_loss_avg, train_recon_avg, train_kld_avg, val_loss_avg, val_recon_avg, val_kld_avg))
+        
+        # Écriture dans le fichier CSV
+        with open(vgae_metrics_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([epoch, current_lr, train_loss_avg, train_recon_avg, train_kld_avg, 
+                             val_loss_avg, val_recon_avg, val_kld_avg])
             
-        scheduler.step()
+        warmup_scheduler.step(train_loss_all_recon/cnt_train)
 
         if best_val_loss >= val_loss_all:
             best_val_loss = val_loss_all
@@ -197,7 +264,7 @@ sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
 posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
 
 # initialize denoising model
-denoise_model = DenoiseNN(input_dim=args.latent_dim, hidden_dim=args.hidden_dim_denoise, n_layers=args.n_layers_denoise, n_cond=args.n_condition, d_cond=args.dim_condition).to(device)
+denoise_model = DenoiseNN(input_dim=args.latent_dim, hidden_dim=args.hidden_dim_denoise, n_layers=args.n_layers_denoise, n_cond=args.n_condition, d_cond=args.dim_condition, d_prompt=args.dim_prompt).to(device)
 optimizer = torch.optim.Adam(denoise_model.parameters(), lr=args.lr)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
 
@@ -213,7 +280,8 @@ if args.train_denoiser:
             optimizer.zero_grad()
             x_g = autoencoder.encode(data)
             t = torch.randint(0, args.timesteps, (x_g.size(0),), device=device).long()
-            loss = p_losses(denoise_model, x_g, t, data.stats, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, loss_type="huber")
+            conds = [data.stats, data.prompt]
+            loss = p_losses(denoise_model, x_g, t, conds, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, loss_type="huber")
             loss.backward()
             train_loss_all += x_g.size(0) * loss.item()
             train_count += x_g.size(0)
@@ -226,13 +294,26 @@ if args.train_denoiser:
             data = data.to(device)
             x_g = autoencoder.encode(data)
             t = torch.randint(0, args.timesteps, (x_g.size(0),), device=device).long()
-            loss = p_losses(denoise_model, x_g, t, data.stats, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, loss_type="huber")
+            conds = [data.stats, data.prompt]
+            loss = p_losses(denoise_model, x_g, t, conds, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, loss_type="huber")
             val_loss_all += x_g.size(0) * loss.item()
             val_count += x_g.size(0)
 
+        # Calcul des moyennes des pertes
+        current_lr = scheduler.get_last_lr()[-1]
+        train_loss_avg = train_loss_all / cnt_train
+        val_loss_avg = val_loss_all / cnt_val
+
+        # Affichage des logs
         if epoch % 5 == 0:
             dt_t = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            print('{} Epoch: {:04d}, Train Loss: {:.5f}, Val Loss: {:.5f}'.format(dt_t, epoch, train_loss_all/train_count, val_loss_all/val_count))
+            print('{} Epoch: {:04d}, lr: {:.5f}, Train Loss: {:.5f}, Val Loss: {:.5f}'.format(
+                dt_t, epoch, current_lr, train_loss_avg, val_loss_avg))
+        
+        # Enregistrer les métriques dans le fichier CSV
+        with open(denoiser_metrics_file, mode='a', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow([epoch, current_lr, train_loss_avg, val_loss_avg])
 
         scheduler.step()
 
@@ -263,7 +344,8 @@ with open("output.csv", "w", newline="") as csvfile:
 
         graph_ids = data.filename
 
-        samples = sample(denoise_model, data.stats, latent_dim=args.latent_dim, timesteps=args.timesteps, betas=betas, batch_size=bs)
+        conds = [data.stats, data.prompt]
+        samples = sample(denoise_model, conds, latent_dim=args.latent_dim, timesteps=args.timesteps, betas=betas, batch_size=bs)
         x_sample = samples[-1]
         adj = autoencoder.decode_mu(x_sample)
         stat_d = torch.reshape(stat, (-1, args.n_condition))
