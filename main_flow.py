@@ -22,7 +22,6 @@ from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 from utils import construct_nx_from_adj, linear_beta_schedule, preprocess_dataset
-import torch.nn.utils as nn_utils
 
 np.random.seed(13)
 
@@ -125,12 +124,6 @@ scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
 warmup_epochs = int(0.5 * args.epochs_autoencoder)  # 30% of total epochs
 beta_final = 1e-4                                   # you can adjust
 
-# # Gumbel-Softmax scheduling
-# tau_start = 5.0
-# tau_min = 0.5
-# tau_decay = 0.5  
-# tau = tau_start
-
 args.train_autoencoder = True
 # Train VGAE model
 if args.train_autoencoder:
@@ -198,125 +191,121 @@ else:
 autoencoder.eval()
 
 
+# initialize Flow model
+from flow_model import FlowNN, sample_flow,flow_loss
+flow_model = FlowNN(
+    latent_dim=args.latent_dim,  
+    n_cond= args.n_condition,
+    cond_dim=args.dim_condition,      
+    hidden_dim=args.hidden_dim_denoise,  
+    time_emb_dim=128                # an arbitrary choice
+).to(device)
 
-# define beta schedule
-betas = linear_beta_schedule(timesteps=args.timesteps)
-
-# define alphas
-alphas = 1. - betas
-alphas_cumprod = torch.cumprod(alphas, axis=0)
-alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
-sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
-
-# calculations for diffusion q(x_t | x_{t-1}) and others
-sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
-
-# calculations for posterior q(x_{t-1} | x_t, x_0)
-posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-
-# initialize denoising model
-denoise_model = DenoiseNN(input_dim=args.latent_dim, hidden_dim=args.hidden_dim_denoise, n_layers=args.n_layers_denoise, n_cond=args.n_condition, d_cond=args.dim_condition).to(device)
-# denoise_model = DenoiseNN(
-#     input_dim=args.latent_dim,
-#     hidden_dim=args.hidden_dim_denoise,
-#     n_layers=args.n_layers_denoise,
-#     n_cond=args.n_condition,
-#     d_cond=args.dim_condition,
-#     num_heads=7  
-# ).to(device)
-
-optimizer = torch.optim.Adam(denoise_model.parameters(), lr=args.lr)
+optimizer = torch.optim.Adam(flow_model.parameters(), lr=args.lr)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
 
 args.train_denoiser = True
 
 
-# Train denoising model
+# Train flow model
 if args.train_denoiser:
-    best_val_loss = np.inf
-    for epoch in range(1, args.epochs_denoise+1):
-        denoise_model.train()
+    best_val_loss = float('inf')
+    for epoch in range(1, args.epochs_denoise + 1):
+        flow_model.train()
         train_loss_all = 0
         train_count = 0
+
         for data in train_loader:
             data = data.to(device)
             optimizer.zero_grad()
-            x_g = autoencoder.encode(data)
-            t = torch.randint(0, args.timesteps, (x_g.size(0),), device=device).long()
-            loss = p_losses(denoise_model, x_g, t, data.stats, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, loss_type="huber")
+            
+            # 1) Encode data to get z1
+            z1 = autoencoder.encode(data)
+            # 2) Sample z0 from N(0,I)
+            z0 = torch.randn_like(z1)
+            # 3) Condition vector
+            cond = data.stats  # shape (B, cond_dim)
+
+            # 4) Flow matching loss
+            loss = flow_loss(flow_model, z0, z1, cond, loss_type="huber")
             loss.backward()
-            train_loss_all += x_g.size(0) * loss.item()
-            train_count += x_g.size(0)
-            # ---- GRADIENT CLIPPING ----
-            nn_utils.clip_grad_norm_(denoise_model.parameters(), max_norm=1.0)
             optimizer.step()
-        denoise_model.eval()
+
+            train_loss_all += loss.item() * z0.size(0)
+            train_count += z0.size(0)
+
+        # Evaluate on val
+        flow_model.eval()
         val_loss_all = 0
         val_count = 0
-        for data in val_loader:
-            data = data.to(device)
-            x_g = autoencoder.encode(data)
-            t = torch.randint(0, args.timesteps, (x_g.size(0),), device=device).long()
-            loss = p_losses(denoise_model, x_g, t, data.stats, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, loss_type="huber")
-            val_loss_all += x_g.size(0) * loss.item()
-            val_count += x_g.size(0)
+        with torch.no_grad():
+            for data in val_loader:
+                data = data.to(device)
+                z1 = autoencoder.encode(data)
+                z0 = torch.randn_like(z1)
+                cond = data.stats
+                loss = flow_loss(flow_model, z0, z1, cond, loss_type="huber")
+                val_loss_all += loss.item() * z0.size(0)
+                val_count += z0.size(0)
 
+        train_loss_avg = train_loss_all / train_count
+        val_loss_avg   = val_loss_all / val_count
         if epoch % 5 == 0:
-            dt_t = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            print('{} Epoch: {:04d}, Train Loss: {:.5f}, Val Loss: {:.5f}'.format(dt_t, epoch, train_loss_all/train_count, val_loss_all/val_count))
+            print(f"Epoch {epoch}, Train Loss={train_loss_avg:.4f}, Val Loss={val_loss_avg:.4f}")
 
-        scheduler.step()
-
-        if best_val_loss >= val_loss_all:
-            best_val_loss = val_loss_all
-            torch.save({
-                'state_dict': denoise_model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-            }, 'denoise_model.pth.tar')
+        # Save best model
+        if val_loss_avg < best_val_loss:
+            best_val_loss = val_loss_avg
+            torch.save({'state_dict': flow_model.state_dict()}, "flow_model.pth.tar")
 else:
-    checkpoint = torch.load('denoise_model.pth.tar')
-    denoise_model.load_state_dict(checkpoint['state_dict'])
-
-denoise_model.eval()
+    # Load existing flow model
+    ckpt = torch.load("flow_model.pth.tar", map_location=device)
+    flow_model.load_state_dict(ckpt['state_dict'])
+    flow_model.eval()
 
 #del train_loader, val_loader
 
 
 
-
-
-
 ### output.csv used for kaggle : 
 # Save to a CSV file
-with open("output.csv", "w", newline="") as csvfile:
+with open("output_flow.csv", "w", newline="") as csvfile:
     writer = csv.writer(csvfile)
-    # Write the header
     writer.writerow(["graph_id", "edge_list"])
-    for k, data in enumerate(tqdm(test_loader, desc='Processing test set',)):
-        data = data.to(device)
-        
-        stat = data.stats
-        bs = stat.size(0)
 
+    for k, data in enumerate(tqdm(test_loader, desc='Processing test set')):
+        data = data.to(device)
+
+        stat = data.stats    # shape (B, n_condition) or similar
+        bs = stat.size(0)
         graph_ids = data.filename
 
-        samples = sample(denoise_model, data.stats, latent_dim=args.latent_dim, timesteps=args.timesteps, betas=betas, batch_size=bs)
-        x_sample = samples[-1]
-        adj = autoencoder.decode_mu(x_sample,data)
-        stat_d = torch.reshape(stat, (-1, args.n_condition))
+        # -----------------------------------------
+        # 1) Flow-based sampling in latent space
+        #    "sample_flow" is from your flow_model.py
+        # -----------------------------------------
+        # The cond must be shape (B, cond_dim)
+        z_sample = sample_flow(
+            flow_model=flow_model,
+            cond=stat,
+            batch_size=bs,
+            latent_dim=args.latent_dim,
+            n_steps=50  
+        )
 
+        # -----------------------------------------
+        # 2) Decode the sampled latents
+        # -----------------------------------------
+        adj = autoencoder.decode_mu(z_sample,data)  # shape (B, N, N) adjacency
+        stat_d = stat.view(bs, args.n_condition)
 
-        for i in range(stat.size(0)):
-            stat_x = stat_d[i]
+        # -----------------------------------------
+        # 3) Convert adjacency -> edges, write CSV
+        # -----------------------------------------
+        for i in range(bs):
+            Gs_generated = construct_nx_from_adj(adj[i].detach().cpu().numpy())
 
-            Gs_generated = construct_nx_from_adj(adj[i,:,:].detach().cpu().numpy())
-            stat_x = stat_x.detach().cpu().numpy()
-
-            # Define a graph ID
             graph_id = graph_ids[i]
+            edge_list_text = ", ".join([f"({u}, {v})" for u, v in Gs_generated.edges()])
 
-            # Convert the edge list to a single string
-            edge_list_text = ", ".join([f"({u}, {v})" for u, v in Gs_generated.edges()])           
-            # Write the graph ID and the full edge list as a single row
             writer.writerow([graph_id, edge_list_text])

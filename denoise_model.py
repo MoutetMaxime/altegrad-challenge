@@ -58,6 +58,116 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
+    
+# class CrossAttention(nn.Module):
+#     """
+#     Cross-attention block based on MultiheadAttention:
+#     - x is your 'query'
+#     - cond is your 'key' and 'value'
+#     """
+#     def __init__(self, embed_dim, num_heads=4):
+#         super().__init__()
+#         self.attn = nn.MultiheadAttention(embed_dim, num_heads=num_heads, batch_first=True)
+
+#     def forward(self, x, context):
+#         # x:  (B, Nx, embed_dim)
+#         # context: (B, Ny, embed_dim)
+#         # We do cross-attention: queries = x, keys=values=context
+#         out, _ = self.attn(query=x, key=context, value=context)
+#         return out
+    
+# class DenoiseNN(nn.Module):
+#     def __init__(self, input_dim, hidden_dim, n_layers, n_cond, d_cond, num_heads=4):
+#         super(DenoiseNN, self).__init__()
+#         self.n_layers = n_layers
+#         self.n_cond = n_cond
+
+#         # Project the condition to d_cond
+#         self.cond_mlp = nn.Sequential(
+#             nn.Linear(n_cond, d_cond),
+#             nn.ReLU(),
+#             nn.Linear(d_cond, hidden_dim),
+#         )
+
+#         # # Additional projection so that cond can match 'hidden_dim' for attention
+#         # self.cond_proj = nn.Linear(d_cond, hidden_dim)
+
+#         self.time_mlp = nn.Sequential(
+#             SinusoidalPositionEmbeddings(hidden_dim),
+#             nn.Linear(hidden_dim, hidden_dim),
+#             nn.GELU(),
+#             nn.Linear(hidden_dim, hidden_dim),
+#         )
+
+#         # Our MLP layers are mostly the same
+#         # but we will incorporate cross-attn in between them.
+#         mlp_layers = []
+#         mlp_layers.append(nn.Linear(input_dim, hidden_dim))
+#         for i in range(n_layers-2):
+#             mlp_layers.append(nn.Linear(hidden_dim, hidden_dim))
+#         mlp_layers.append(nn.Linear(hidden_dim, input_dim))
+#         self.mlp = nn.ModuleList(mlp_layers)
+
+#         # Batch norm layers
+#         bn_layers = [nn.BatchNorm1d(hidden_dim) for _ in range(n_layers-1)]
+#         self.bn = nn.ModuleList(bn_layers)
+
+#         self.relu = nn.ReLU()
+#         self.tanh = nn.Tanh()
+
+#         # Cross-attention block
+#         self.cross_attn = CrossAttention(embed_dim=hidden_dim, num_heads=num_heads)
+
+#     def forward(self, x, t, cond):
+#         """
+#         x:   (B, input_dim)    <- e.g. your noisy latent
+#         t:   (B,)              <- timesteps
+#         cond:(B, n_cond)       <- conditioning stats
+#         """
+#         # Process condition
+#         cond = cond.reshape(-1, self.n_cond)
+#         cond = torch.nan_to_num(cond, nan=-100.0)
+#         cond_feat = self.cond_mlp(cond)               # shape: (B, d_cond)
+#         # cond_feat = self.cond_proj(cond_feat)         # shape: (B, hidden_dim)
+
+#         # Process time embedding
+#         t_emb = self.time_mlp(t)  # shape: (B, hidden_dim)
+
+#         # We'll do an MLP pass, injecting cross-attention somewhere in the middle
+#         # Start with x -> hidden_dim
+#         x_h = self.mlp[0](x)      # shape: (B, hidden_dim)
+
+#         # For each hidden layer except the last one
+#         for i in range(self.n_layers - 1):
+#             # Add time embedding
+#             x_h = x_h + t_emb
+
+#             # BatchNorm expects (B, hidden_dim) but cross-attn needs (B, seq_len, hidden_dim).
+#             # We'll do BN first, then cross-attn
+#             x_h = self.bn[i](x_h) # shape: (B, hidden_dim)
+#             x_h = self.relu(x_h)
+
+#             # Reshape x_h and cond for attention: (B, 1, hidden_dim)
+#             x_3d = x_h.unsqueeze(1)
+#             cond_3d = cond_feat.unsqueeze(1)
+
+#             # Cross-attend: queries=x_3d, keys=cond_3d
+#             # shape out: (B, 1, hidden_dim)
+#             x_attn = self.cross_attn(x_3d, cond_3d)
+
+#             # Flatten back to (B, hidden_dim)
+#             x_h = x_attn.squeeze(1)
+
+#             # If not at the last hidden -> next MLP
+#             if i < (self.n_layers - 2):
+#                 x_h = self.mlp[i+1](x_h)
+
+#         # Finally, apply the last linear that outputs the predicted noise
+#         # (We already used i up to n_layers-2, so the last layer is index n_layers-1)
+#         x_out = self.mlp[self.n_layers - 1](x_h)
+
+#         return x_out
+
 
 
 # Denoise model
@@ -105,6 +215,7 @@ class DenoiseNN(nn.Module):
 @torch.no_grad()
 def p_sample(model, x, t, cond, t_index, betas):
     # define alphas
+
     alphas = 1. - betas
     alphas_cumprod = torch.cumprod(alphas, axis=0)
     alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
