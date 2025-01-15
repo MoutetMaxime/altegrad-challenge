@@ -6,35 +6,37 @@ from torch_geometric.nn import GATConv, GINConv, global_add_pool
 
 # Decoder
 class Decoder(nn.Module):
-    def __init__(self, latent_dim, hidden_dim, n_layers, n_nodes):
+    def __init__(self, latent_dim, hidden_dim, n_layers, n_nodes, n_cond=7):
         super(Decoder, self).__init__()
         self.n_layers = n_layers
         self.n_nodes = n_nodes
 
-        mlp_layers = [nn.Linear(latent_dim, hidden_dim)] + [nn.Linear(hidden_dim, hidden_dim) for i in range(n_layers-2)]
-        mlp_layers.append(nn.Linear(hidden_dim, 2*n_nodes*(n_nodes-1)//2))
+        mlp_layers = [nn.Linear(latent_dim + n_cond, hidden_dim)] + [
+            nn.Linear(hidden_dim, hidden_dim) for i in range(n_layers - 2)
+        ]
+        mlp_layers.append(nn.Linear(hidden_dim, 2 * n_nodes * (n_nodes - 1) // 2))
 
         self.mlp = nn.ModuleList(mlp_layers)
         self.relu = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x):
-        for i in range(self.n_layers-1):
+    def forward(self, x, data):
+        stats = data.stats
+        x = torch.cat((x, stats), axis=1)
+
+        for i in range(self.n_layers - 1):
             x = self.relu(self.mlp[i](x))
-        
-        x = self.mlp[self.n_layers-1](x)
+
+        x = self.mlp[self.n_layers - 1](x)
         x = torch.reshape(x, (x.size(0), -1, 2))
-        x = F.gumbel_softmax(x, tau=1, hard=True)[:,:,0]
+        x = F.gumbel_softmax(x, tau=1, hard=True)[:, :, 0]
 
         adj = torch.zeros(x.size(0), self.n_nodes, self.n_nodes, device=x.device)
         idx = torch.triu_indices(self.n_nodes, self.n_nodes, 1)
-        adj[:,idx[0],idx[1]] = x
+        adj[:, idx[0], idx[1]] = x
         adj = adj + torch.transpose(adj, 1, 2)
         return adj
-
-
-
-
+    
 class GIN(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, n_layers, dropout=0.2):
         super().__init__()
@@ -112,10 +114,17 @@ class GAT(torch.nn.Module):
         return out
 
 
-
-# Variational Autoencoder
 class VariationalAutoEncoder(nn.Module):
-    def __init__(self, input_dim, hidden_dim_enc, hidden_dim_dec, latent_dim, n_layers_enc, n_layers_dec, n_max_nodes):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim_enc,
+        hidden_dim_dec,
+        latent_dim,
+        n_layers_enc,
+        n_layers_dec,
+        n_max_nodes,
+    ):
         super(VariationalAutoEncoder, self).__init__()
         self.n_max_nodes = n_max_nodes
         self.input_dim = input_dim
@@ -137,7 +146,7 @@ class VariationalAutoEncoder(nn.Module):
         mu = self.fc_mu(x_g)
         logvar = self.fc_logvar(x_g)
         x_g = self.reparameterize(mu, logvar)
-        adj = self.decoder(x_g)
+        adj = self.decoder(x_g, data)
         return adj
 
     def encode(self, data):
@@ -147,7 +156,7 @@ class VariationalAutoEncoder(nn.Module):
         x_g = self.reparameterize(mu, logvar)
         return x_g
 
-    def reparameterize(self, mu, logvar, eps_scale=1.):
+    def reparameterize(self, mu, logvar, eps_scale=1.0):
         if self.training:
             std = logvar.mul(0.5).exp_()
             eps = torch.randn_like(std) * eps_scale
@@ -155,24 +164,24 @@ class VariationalAutoEncoder(nn.Module):
         else:
             return mu
 
-    def decode(self, mu, logvar):
-       x_g = self.reparameterize(mu, logvar)
-       adj = self.decoder(x_g)
-       return adj
+    def decode(self, mu, logvar, data):
+        x_g = self.reparameterize(mu, logvar)
+        adj = self.decoder(x_g, data)
+        return adj
 
-    def decode_mu(self, mu):
-       adj = self.decoder(mu)
-       return adj
+    def decode_mu(self, mu, data):
+        adj = self.decoder(mu, data)
+        return adj
 
-    def loss_function(self, data, beta=0.05):
-        x_g  = self.encoder(data)
+    def loss_function(self, data, beta):
+        x_g = self.encoder(data)
         mu = self.fc_mu(x_g)
         logvar = self.fc_logvar(x_g)
         x_g = self.reparameterize(mu, logvar)
-        adj = self.decoder(x_g)
-        
-        recon = F.l1_loss(adj, data.A, reduction='mean')
+        adj = self.decoder(x_g, data)
+
+        recon = F.l1_loss(adj, data.A, reduction="mean")
         kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        loss = recon + beta*kld
+        loss = recon + beta * kld
 
         return loss, recon, kld

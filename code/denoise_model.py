@@ -58,8 +58,7 @@ class SinusoidalPositionEmbeddings(nn.Module):
         embeddings = time[:, None] * embeddings[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
         return embeddings
-
-
+    
 # Denoise model
 class DenoiseNN(nn.Module):
     def __init__(self, input_dim, hidden_dim, n_layers, n_cond, d_cond, d_prompt):
@@ -111,6 +110,7 @@ class DenoiseNN(nn.Module):
 @torch.no_grad()
 def p_sample(model, x, t, conds, t_index, betas):
     # define alphas
+
     alphas = 1. - betas
     alphas_cumprod = torch.cumprod(alphas, axis=0)
     alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)

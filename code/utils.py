@@ -231,7 +231,7 @@ def sigmoid_beta_schedule(timesteps):
 
 def create_training_folder(description, args):
     dt_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    training_folder = f"/Users/maximemoutet/Documents/Scolaire/M2DS/ALTEGRAD/data-challenge/data/trainings/training_{dt_str}"
+    training_folder = f"/Users/aline/Documents/Scolaire/M2DS/ALTEGRAD/data-challenge/data/trainings/training_{dt_str}"
     os.makedirs(training_folder, exist_ok=True)
 
     # Enregistrer les arguments et la description dans un fichier texte

@@ -21,14 +21,7 @@ from torch.utils.data import Subset
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
-from utils import (
-    construct_nx_from_adj,
-    create_training_folder,
-    linear_beta_schedule,
-    preprocess_dataset,
-)
-from warmup_scheduler import WarmupReduceLROnPlateau
-import torch.nn.utils as nn_utils
+from utils import construct_nx_from_adj, linear_beta_schedule, preprocess_dataset
 
 np.random.seed(13)
 
@@ -104,23 +97,16 @@ parser.add_argument('--dim-condition', type=int, default=128, help="Dimensionali
 # Number of conditions used in conditional vector (number of properties)
 parser.add_argument('--n-condition', type=int, default=7, help="Number of distinct condition properties used in conditional vector (default: 7)")
 
-# Dimensionality of prompt embeddings
-parser.add_argument('--dim-prompt', type=int, default=384, help="Dimensionality of prompt embeddings (default: 384)")
-
-parser.add_argument('--promp-encoding-model', type=str, default='sentence-transformers/all-MiniLM-L6-v2', help="Prompt encoding model (default: sentence-transformers/all-MiniLM-L6-v2)")
-
-parser.add_argument("--metrics-name", type=str, default="metrics.csv", help="Name of the metrics file (default: metrics.csv)")
-parser.add_argument("--denoiser-metrics-name", type=str, default="denoiser_metrics.csv", help="Name of the denoiser metrics file (default: denoiser_metrics.csv)")
-parser.add_argument("--training-description", type=str, default="This training session focuses on VGAE and Denoiser models with specific hyperparameters and data preprocessing methods.", help="Description of the training session (default: This training session focuses on VGAE and Denoiser models with specific hyperparameters and data preprocessing methods.)")
-
 args = parser.parse_args()
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 # preprocess train data, validation data and test data. Only once for the first time that you run the code. Then the appropriate .pt files will be saved and loaded.
-trainset = preprocess_dataset("train", args.n_max_nodes, args.spectral_emb_dim, args.promp_encoding_model)
-validset = preprocess_dataset("valid", args.n_max_nodes, args.spectral_emb_dim, args.promp_encoding_model)
-testset = preprocess_dataset("test", args.n_max_nodes, args.spectral_emb_dim, args.promp_encoding_model)
+trainset = preprocess_dataset("train", args.n_max_nodes, args.spectral_emb_dim)
+validset = preprocess_dataset("valid", args.n_max_nodes, args.spectral_emb_dim)
+testset = preprocess_dataset("test", args.n_max_nodes, args.spectral_emb_dim)
+
+
 
 # initialize data loaders
 train_loader = DataLoader(trainset, batch_size=args.batch_size, shuffle=True)
@@ -131,46 +117,8 @@ test_loader = DataLoader(testset, batch_size=args.batch_size, shuffle=False)
 # initialize VGAE model
 autoencoder = VariationalAutoEncoder(args.spectral_emb_dim+1, args.hidden_dim_encoder, args.hidden_dim_decoder, args.latent_dim, args.n_layers_encoder, args.n_layers_decoder, args.n_max_nodes).to(device)
 
-# optimizer = torch.optim.Adam(autoencoder.parameters(), lr=args.lr)
-optimizer = torch.optim.AdamW(autoencoder.parameters(), lr=args.lr, betas=(0.9, 0.999))
-
-
-# scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
-### Scheduler ###
-# decrease learning rate by a factor of 0.5 if the train reconstruction loss does not decrease for 10 epochs
-# add a warm-up phase for the first 100 epochs
-reduce_on_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
-warmup_scheduler = WarmupReduceLROnPlateau(
-    optimizer=optimizer,
-    scheduler=reduce_on_plateau,
-    warmup_steps=100,
-    initial_lr=1e-5,
-    target_lr=1e-3
-)
-
-
-# Fichier pour sauvegarder les métriques
-metrics_file = args.metrics_name
-denoiser_metrics_file = args.denoiser_metrics_name
-training_description = args.training_description
-
-# Créer le dossier pour l'entraînement
-training_folder = create_training_folder(training_description, args)
-
-# Fichiers de métriques dans le dossier
-vgae_metrics_file = os.path.join(training_folder, metrics_file)
-denoiser_metrics_file = os.path.join(training_folder, denoiser_metrics_file)
-
-
-# Sauvegarde des métriques dans un fichier CSV
-with open(vgae_metrics_file, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(["Epoch", "Learning Rate", "Train Loss", "Train Recon Loss", "Train KLD Loss", 
-                     "Val Loss", "Val Recon Loss", "Val KLD Loss"])
-
-with open(denoiser_metrics_file, mode='w', newline='') as file:
-    writer = csv.writer(file)
-    writer.writerow(["Epoch", "Learning Rate", "Train Loss", "Val Loss"])
+optimizer = torch.optim.Adam(autoencoder.parameters(), lr=args.lr)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
 
 # KL-annealing
 warmup_epochs = int(0.5 * args.epochs_autoencoder)  # 30% of total epochs
@@ -224,27 +172,11 @@ if args.train_autoencoder:
                 cnt_val+=1
                 val_count += torch.max(data.batch)+1
 
-        # Logging et sauvegarde des métriques
-        current_lr = warmup_scheduler.get_last_lr()[-1]
-        train_loss_avg = train_loss_all / cnt_train
-        val_loss_avg = val_loss_all / cnt_val
-        train_recon_avg = train_loss_all_recon / cnt_train
-        train_kld_avg = train_loss_all_kld / cnt_train
-        val_recon_avg = val_loss_all_recon / cnt_val
-        val_kld_avg = val_loss_all_kld / cnt_val
-
         if epoch % 1 == 0:
             dt_t = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            print('{} Epoch: {:04d}, lr: {:.5f}, Train Loss: {:.5f}, Train Recon Loss: {:.3f}, Train KLD Loss: {:.2f}, Val Loss: {:.5f}, Val Recon Loss: {:.3f}, Val KLD Loss: {:.2f}'.format(
-                dt_t, epoch, current_lr, train_loss_avg, train_recon_avg, train_kld_avg, val_loss_avg, val_recon_avg, val_kld_avg))
-        
-        # Écriture dans le fichier CSV
-        with open(vgae_metrics_file, mode='a', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([epoch, current_lr, train_loss_avg, train_recon_avg, train_kld_avg, 
-                             val_loss_avg, val_recon_avg, val_kld_avg])
+            print('{} Epoch: {:04d}, Train Loss: {:.5f}, Train Reconstruction Loss: {:.2f}, Train KLD Loss: {:.2f}, Val Loss: {:.5f}, Val Reconstruction Loss: {:.2f}, Val KLD Loss: {:.2f}'.format(dt_t,epoch, train_loss_all/cnt_train, train_loss_all_recon/cnt_train, train_loss_all_kld/cnt_train, val_loss_all/cnt_val, val_loss_all_recon/cnt_val, val_loss_all_kld/cnt_val))
             
-        warmup_scheduler.step(train_loss_all_recon/cnt_train)
+        scheduler.step()
 
         if best_val_loss >= val_loss_all:
             best_val_loss = val_loss_all
@@ -259,124 +191,121 @@ else:
 autoencoder.eval()
 
 
+# initialize Flow model
+from flow_model import FlowNN, sample_flow,flow_loss
+flow_model = FlowNN(
+    latent_dim=args.latent_dim,  
+    n_cond= args.n_condition,
+    cond_dim=args.dim_condition,      
+    hidden_dim=args.hidden_dim_denoise,  
+    time_emb_dim=128                # an arbitrary choice
+).to(device)
 
-# define beta schedule
-betas = linear_beta_schedule(timesteps=args.timesteps)
-
-# define alphas
-alphas = 1. - betas
-alphas_cumprod = torch.cumprod(alphas, axis=0)
-alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
-sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
-
-# calculations for diffusion q(x_t | x_{t-1}) and others
-sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
-
-# calculations for posterior q(x_{t-1} | x_t, x_0)
-posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-
-# initialize denoising model
-denoise_model = DenoiseNN(input_dim=args.latent_dim, hidden_dim=args.hidden_dim_denoise, n_layers=args.n_layers_denoise, n_cond=args.n_condition, d_cond=args.dim_condition, d_prompt=args.dim_prompt).to(device)
-optimizer = torch.optim.Adam(denoise_model.parameters(), lr=args.lr)
+optimizer = torch.optim.Adam(flow_model.parameters(), lr=args.lr)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.1)
 
 args.train_denoiser = True
 
 
-# Train denoising model
+# Train flow model
 if args.train_denoiser:
-    best_val_loss = np.inf
-    for epoch in range(1, args.epochs_denoise+1):
-        denoise_model.train()
+    best_val_loss = float('inf')
+    for epoch in range(1, args.epochs_denoise + 1):
+        flow_model.train()
         train_loss_all = 0
         train_count = 0
+
         for data in train_loader:
             data = data.to(device)
             optimizer.zero_grad()
-            x_g = autoencoder.encode(data)
-            t = torch.randint(0, args.timesteps, (x_g.size(0),), device=device).long()
-            conds = [data.stats, data.prompt]
-            loss = p_losses(denoise_model, x_g, t, conds, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, loss_type="huber")
+            
+            # 1) Encode data to get z1
+            z1 = autoencoder.encode(data)
+            # 2) Sample z0 from N(0,I)
+            z0 = torch.randn_like(z1)
+            # 3) Condition vector
+            cond = data.stats  # shape (B, cond_dim)
+
+            # 4) Flow matching loss
+            loss = flow_loss(flow_model, z0, z1, cond, loss_type="huber")
             loss.backward()
-            train_loss_all += x_g.size(0) * loss.item()
-            train_count += x_g.size(0)
-            # ---- GRADIENT CLIPPING ----
-            nn_utils.clip_grad_norm_(denoise_model.parameters(), max_norm=1.0)
             optimizer.step()
-        denoise_model.eval()
+
+            train_loss_all += loss.item() * z0.size(0)
+            train_count += z0.size(0)
+
+        # Evaluate on val
+        flow_model.eval()
         val_loss_all = 0
         val_count = 0
-        for data in val_loader:
-            data = data.to(device)
-            x_g = autoencoder.encode(data)
-            t = torch.randint(0, args.timesteps, (x_g.size(0),), device=device).long()
-            conds = [data.stats, data.prompt]
-            loss = p_losses(denoise_model, x_g, t, conds, sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod, loss_type="huber")
-            val_loss_all += x_g.size(0) * loss.item()
-            val_count += x_g.size(0)
+        with torch.no_grad():
+            for data in val_loader:
+                data = data.to(device)
+                z1 = autoencoder.encode(data)
+                z0 = torch.randn_like(z1)
+                cond = data.stats
+                loss = flow_loss(flow_model, z0, z1, cond, loss_type="huber")
+                val_loss_all += loss.item() * z0.size(0)
+                val_count += z0.size(0)
 
-        # Calcul des moyennes des pertes
-        current_lr = scheduler.get_last_lr()[-1]
-        train_loss_avg = train_loss_all / cnt_train
-        val_loss_avg = val_loss_all / cnt_val
-
-        # Affichage des logs
+        train_loss_avg = train_loss_all / train_count
+        val_loss_avg   = val_loss_all / val_count
         if epoch % 5 == 0:
-            dt_t = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-            print('{} Epoch: {:04d}, lr: {:.5f}, Train Loss: {:.5f}, Val Loss: {:.5f}'.format(
-                dt_t, epoch, current_lr, train_loss_avg, val_loss_avg))
-        
-        # Enregistrer les métriques dans le fichier CSV
-        with open(denoiser_metrics_file, mode='a', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow([epoch, current_lr, train_loss_avg, val_loss_avg])
+            print(f"Epoch {epoch}, Train Loss={train_loss_avg:.4f}, Val Loss={val_loss_avg:.4f}")
 
-        scheduler.step()
-
-        if best_val_loss >= val_loss_all:
-            best_val_loss = val_loss_all
-            torch.save({
-                'state_dict': denoise_model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
-            }, 'denoise_model.pth.tar')
+        # Save best model
+        if val_loss_avg < best_val_loss:
+            best_val_loss = val_loss_avg
+            torch.save({'state_dict': flow_model.state_dict()}, "flow_model.pth.tar")
 else:
-    checkpoint = torch.load('denoise_model.pth.tar')
-    denoise_model.load_state_dict(checkpoint['state_dict'])
+    # Load existing flow model
+    ckpt = torch.load("flow_model.pth.tar", map_location=device)
+    flow_model.load_state_dict(ckpt['state_dict'])
+    flow_model.eval()
 
-denoise_model.eval()
+#del train_loader, val_loader
+
+
 
 ### output.csv used for kaggle : 
 # Save to a CSV file
-with open("output.csv", "w", newline="") as csvfile:
+with open("output_flow.csv", "w", newline="") as csvfile:
     writer = csv.writer(csvfile)
-    # Write the header
     writer.writerow(["graph_id", "edge_list"])
-    for k, data in enumerate(tqdm(test_loader, desc='Processing test set',)):
-        data = data.to(device)
-        
-        stat = data.stats
-        bs = stat.size(0)
 
+    for k, data in enumerate(tqdm(test_loader, desc='Processing test set')):
+        data = data.to(device)
+
+        stat = data.stats    # shape (B, n_condition) or similar
+        bs = stat.size(0)
         graph_ids = data.filename
 
-        conds = [data.stats, data.prompt]
-        samples = sample(denoise_model, conds, latent_dim=args.latent_dim, timesteps=args.timesteps, betas=betas, batch_size=bs)
-        x_sample = samples[-1]
-        adj = autoencoder.decode_mu(x_sample,data)
-        stat_d = torch.reshape(stat, (-1, args.n_condition))
+        # -----------------------------------------
+        # 1) Flow-based sampling in latent space
+        #    "sample_flow" is from your flow_model.py
+        # -----------------------------------------
+        # The cond must be shape (B, cond_dim)
+        z_sample = sample_flow(
+            flow_model=flow_model,
+            cond=stat,
+            batch_size=bs,
+            latent_dim=args.latent_dim,
+            n_steps=50  
+        )
 
+        # -----------------------------------------
+        # 2) Decode the sampled latents
+        # -----------------------------------------
+        adj = autoencoder.decode_mu(z_sample,data)  # shape (B, N, N) adjacency
+        stat_d = stat.view(bs, args.n_condition)
 
-        for i in range(stat.size(0)):
-            stat_x = stat_d[i]
+        # -----------------------------------------
+        # 3) Convert adjacency -> edges, write CSV
+        # -----------------------------------------
+        for i in range(bs):
+            Gs_generated = construct_nx_from_adj(adj[i].detach().cpu().numpy())
 
-            Gs_generated = construct_nx_from_adj(adj[i,:,:].detach().cpu().numpy())
-            stat_x = stat_x.detach().cpu().numpy()
-
-            # Define a graph ID
             graph_id = graph_ids[i]
+            edge_list_text = ", ".join([f"({u}, {v})" for u, v in Gs_generated.edges()])
 
-            # Convert the edge list to a single string
-            edge_list_text = ", ".join([f"({u}, {v})" for u, v in Gs_generated.edges()])           
-            # Write the graph ID and the full edge list as a single row
             writer.writerow([graph_id, edge_list_text])
