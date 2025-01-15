@@ -13,3 +13,5 @@ __pycache__/
 
 # Ignore all .csv files
 *.csv
+
+*.gitignore
