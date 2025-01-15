@@ -3,6 +3,44 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv, GINConv, global_add_pool
 
+# Cross-Attention Layer
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, hidden_dim, dropout=0.2):
+        super(CrossAttentionLayer, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.dropout = dropout
+
+        # Layers pour Q, K, V pour la cross-attention
+        self.query_layer = nn.Linear(hidden_dim, hidden_dim)
+        self.key_layer = nn.Linear(hidden_dim, hidden_dim)
+        self.value_layer = nn.Linear(hidden_dim, hidden_dim)
+
+        # Layer de sortie
+        self.output_layer = nn.Linear(hidden_dim, hidden_dim)
+
+        # Dropout pour régularisation
+        self.attn_dropout = nn.Dropout(dropout)
+
+    def forward(self, graph_latents, text_latents):
+        # Calcul des Q, K, V pour le mécanisme de cross-attention
+        Q = self.query_layer(graph_latents)  # Requêtes venant du graphe
+        K = self.key_layer(text_latents)  # Clés venant du texte
+        V = self.value_layer(text_latents)  # Valeurs venant du texte
+
+        # Calcul des scores d'attention
+        attn_scores = (
+            torch.matmul(Q, K.transpose(-2, -1)) / self.hidden_dim**0.5
+        )  # Attention
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.attn_dropout(attn_probs)
+
+        # Calcul des valeurs pondérées par l'attention
+        attended_values = torch.matmul(attn_probs, V)
+
+        # Passer les valeurs attentives par la couche de sortie
+        output = self.output_layer(attended_values)
+        return output
+        
 
 # Decoder
 class Decoder(nn.Module):
