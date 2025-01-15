@@ -74,6 +74,57 @@ class Decoder(nn.Module):
         adj[:, idx[0], idx[1]] = x
         adj = adj + torch.transpose(adj, 1, 2)
         return adj
+
+class AutoRegressiveDecoder(nn.Module):
+    def __init__(self, latent_dim, hidden_dim, n_layers, n_nodes):
+        super(AutoRegressiveDecoder, self).__init__()
+
+        self.n_nodes = n_nodes
+        self.n_layers = n_layers
+        self.latent_dim = latent_dim
+
+        # Créer un décodeur sans encodeur
+        self.transformer_decoder_layer = nn.TransformerDecoderLayer(
+            d_model=latent_dim,
+            nhead=4,
+            dim_feedforward=hidden_dim,
+        )
+
+        self.transformer_decoder = nn.TransformerDecoder(
+            self.transformer_decoder_layer, num_layers=n_layers
+        )
+
+        # Couches linéaires pour prédire les arêtes
+        self.fc_out = nn.Linear(
+            latent_dim, self.n_nodes
+        )  # Prédire une probabilité d'arête
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        # x est la représentation latente des nœuds du graphe
+        # Initialisation du tensor de "sequences" vide pour le décodeur Transformer
+        seq_input = torch.zeros(
+            x.size(0), self.n_nodes, self.latent_dim, device=x.device
+        )
+
+        # Transformer pour générer les arêtes une par une
+        output = self.transformer_decoder(
+            tgt=x.unsqueeze(1).repeat(1, self.n_nodes, 1), memory=seq_input
+        )  # [batch_size, n_nodes, latent_dim]
+
+        # Prédiction des probabilités d'arêtes pour chaque paire de nœuds
+        adj_prob = self.fc_out(output)  # [batch_size, n_nodes, n_nodes]
+        # Symétrisation de la matrice d'adjacence
+        adj_prob = torch.triu(
+            adj_prob, diagonal=1
+        )  # Garder que la partie supérieure de la matrice
+
+        # Appliquer la sigmoid pour obtenir des probabilités
+        adj_prob = self.sigmoid(adj_prob)
+
+        adj = (adj_prob + adj_prob.transpose(1, 2)) / 2
+        return adj
+
     
 class GIN(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim, latent_dim, n_layers, dropout=0.2):
